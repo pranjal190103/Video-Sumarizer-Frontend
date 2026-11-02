@@ -41,10 +41,10 @@ Pasted transcripts go to Django for OpenAI analysis and are saved with the resul
 - `GET|PUT|PATCH|DELETE /api/videos/<uuid>/`
 - `POST /api/videos/<uuid>/reanalyze/`
 
-The local database is SQLite. Transcripts are retained for reanalysis. Before production, configure PostgreSQL, authentication and authorization, HTTPS, rate limits, secure secret storage, and restricted CORS. SharePoint/Graph integration is not implemented.
+The backend database is SQLite for this proof of concept. Transcripts are retained for reanalysis. SharePoint/Graph integration, per-user libraries, token authentication, and automatic background synchronization are implemented in Django. Keep the backend worker service running for initial and daily scans; synchronization does not depend on the dashboard being open. Before scaling to multiple backend instances, move SQLite and the worker queue to shared production database/queue infrastructure.
 
 ## Build and deploy
 
 Run `npm run build` for a frontend production build. Deploy the Vite frontend to Vercel and set `VITE_API_BASE_URL` to the separately hosted Django service. Django is not deployed by the Vercel frontend project; set `DJANGO_SECRET_KEY`, `DJANGO_DEBUG=false`, `DJANGO_ALLOWED_HOSTS`, `CORS_ALLOWED_ORIGINS`, `OPENAI_API_KEY`, and optionally `OPENAI_MODEL` on the backend host.
 
-OpenAI summaries are a first pass and the knowledge readiness score is heuristic. SharePoint access still requires an authenticated Microsoft Graph integration.
+OpenAI summaries are a first pass and the knowledge readiness score is heuristic. SharePoint app-only access must be granted the minimum required read permission for the configured folder.

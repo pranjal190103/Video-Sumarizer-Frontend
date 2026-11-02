@@ -9,6 +9,7 @@ export interface VideoRecord {
   title: string;
   sourceUrl?: string;
   sourceType: 'sharepoint' | 'upload' | 'transcript';
+  sourceFolder?: string;
   summary: string;
   transcript?: string;
   categories: Category[];
@@ -19,6 +20,7 @@ export interface VideoRecord {
   trainingReady: boolean;
   status: VideoStatus;
   errorMessage?: string;
+  analysisCompletedAt?: string | null;
   analysisMode: AnalysisMode;
   createdAt: string;
   updatedAt: string;

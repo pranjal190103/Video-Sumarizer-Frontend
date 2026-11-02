@@ -25,11 +25,25 @@ export interface SharePointImport {
   imported: number;
   failed: number;
   batchSize: number;
+  trigger: 'manual' | 'scheduled';
   remaining: number;
   hasMore: boolean;
   errors: Array<{ title?: string; detail: string }>;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface SharePointSyncStatus {
+  lastSuccessfulSync: string | null;
+  lastAttemptAt?: string | null;
+  nextScheduledSync: string | null;
+  syncInProgress?: boolean;
+  discoveredCount: number;
+  awaitingAnalysis: number;
+  analyzedCount: number;
+  failedCount: number;
+  lastError: string;
+  syncIntervalHours: number;
 }
 
 export function getAuthToken(): string | null {
@@ -110,8 +124,12 @@ export function listSharePointImports() {
   return apiRequest<SharePointImport[]>('/api/sharepoint/imports/recent/');
 }
 
-export function startSharePointImport(batchSize: number) {
-  return apiRequest<SharePointImport>('/api/sharepoint/imports/', { method: 'POST', body: JSON.stringify({ batchSize }) });
+export function getSharePointSyncStatus() {
+  return apiRequest<SharePointSyncStatus>('/api/sharepoint/sync-status/');
+}
+
+export function syncSharePointNow() {
+  return apiRequest<{ queued: boolean; syncInProgress: boolean; nextScheduledSync: string | null }>('/api/sharepoint/sync/now/', { method: 'POST', body: JSON.stringify({}) });
 }
 
 export function getSharePointImport(id: string) {
@@ -120,6 +138,10 @@ export function getSharePointImport(id: string) {
 
 export function cancelSharePointImport(id: string) {
   return apiRequest<SharePointImport>(`/api/sharepoint/imports/${id}/cancel/`, { method: 'POST', body: JSON.stringify({}) });
+}
+
+export function retrySharePointVideo(id: string) {
+  return apiRequest<SharePointImport>(`/api/videos/${id}/retry/`, { method: 'POST', body: JSON.stringify({}) });
 }
 
 export function getVideoDetails(id: string) {

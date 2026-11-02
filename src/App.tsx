@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Activity, ArrowLeft, ArrowUpRight, CalendarDays, CheckCircle2, ChevronLeft, ChevronRight, Clapperboard, ExternalLink, FileVideo2, Film, FolderOpen, FolderSync, LoaderCircle, LogOut, Play, Plus, Search, Sparkles, Tags, Trash2, Upload, X } from 'lucide-react';
-import { analyzeWithApi, apiRequest, API_BASE_URL, cancelSharePointImport, clearVideoLibrary, currentAccountWithApi, getAuthToken, getSharePointImport, getVideoDetails, isApiConfigured, listSharePointImports, logoutWithApi, setAuthToken, startSharePointImport, uploadVideoWithApi, type Account, type AuthSession, type SharePointImport } from './services/apiClient';
+import { analyzeWithApi, apiRequest, API_BASE_URL, cancelSharePointImport, clearVideoLibrary, currentAccountWithApi, getAuthToken, getSharePointImport, getSharePointSyncStatus, getVideoDetails, isApiConfigured, listSharePointImports, logoutWithApi, syncSharePointNow, retrySharePointVideo, setAuthToken, uploadVideoWithApi, type Account, type AuthSession, type SharePointImport, type SharePointSyncStatus } from './services/apiClient';
 import { AuthPage } from './components/AuthPage';
 import { UserManual } from './components/UserManual';
 import type { Category, VideoRecord } from './types/video';
@@ -43,6 +43,7 @@ function Dashboard({ account, onLogout }: { account: Account; onLogout: () => vo
   const [selectedVideo, setSelectedVideo] = useState<VideoRecord | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const detailRequestId = useRef(0);
+  const sharepointRetryBusy = useRef<string | null>(null);
   const [videos, setVideos] = useState<VideoRecord[]>([]);
   const [title, setTitle] = useState('');
   const [sourceUrl, setSourceUrl] = useState('');
@@ -59,19 +60,33 @@ function Dashboard({ account, onLogout }: { account: Account; onLogout: () => vo
   const [notice, setNotice] = useState('');
   const [sharepointConfigured, setSharepointConfigured] = useState(false);
   const [sharepointFolderName, setSharepointFolderName] = useState('SharePoint video folder');
-  const [batchSize, setBatchSize] = useState(2);
+  const [sharepointMaxVideoSizeGb, setSharepointMaxVideoSizeGb] = useState(5);
+  const [syncStatus, setSyncStatus] = useState<SharePointSyncStatus | null>(null);
   const [sharepointJob, setSharepointJob] = useState<SharePointImport | null>(null);
   const [sharepointError, setSharepointError] = useState('');
+  const [requestingSync, setRequestingSync] = useState(false);
   const [clearingLibrary, setClearingLibrary] = useState(false);
 
   const refresh = () => {
     if (!isApiConfigured) { setApiState('offline'); setLoading(false); return; }
-    Promise.all([apiRequest<VideoRecord[]>('/api/videos/'), apiRequest<{ openaiConfigured: boolean; sharepointConfigured: boolean; sharepointFolderName: string }>('/api/health/'), listSharePointImports().catch(() => null)])
-      .then(([records, health, imports]) => { const library = records ?? []; const latestJob = imports?.[0] ?? null; const oldFinishedJob = latestJob && ['completed', 'completed_with_errors', 'cancelled'].includes(latestJob.status); setVideos(library); setApiState(health?.openaiConfigured ? 'ready' : 'key-missing'); setSharepointConfigured(Boolean(health?.sharepointConfigured)); setSharepointFolderName(health?.sharepointFolderName || 'SharePoint video folder'); setSharepointJob(library.length === 0 && oldFinishedJob ? null : latestJob); setError(''); })
+    Promise.all([apiRequest<VideoRecord[]>('/api/videos/'), apiRequest<{ openaiConfigured: boolean; sharepointConfigured: boolean; sharepointFolderName: string; sharepointMaxVideoSizeGb?: number }>('/api/health/'), listSharePointImports().catch(() => null), getSharePointSyncStatus()])
+      .then(([records, health, imports, sync]) => { const library = records ?? []; const latestJob = imports?.[0] ?? null; const oldFinishedJob = latestJob && ['completed', 'completed_with_errors', 'cancelled'].includes(latestJob.status); setVideos(library); setSyncStatus(sync); setApiState(health?.openaiConfigured ? 'ready' : 'key-missing'); setSharepointConfigured(Boolean(health?.sharepointConfigured)); setSharepointFolderName(health?.sharepointFolderName || 'SharePoint video folder'); setSharepointMaxVideoSizeGb(health?.sharepointMaxVideoSizeGb || 5); setSharepointJob(library.length === 0 && oldFinishedJob ? null : latestJob); setError(''); })
       .catch((reason: unknown) => { setApiState('offline'); setError(reason instanceof Error ? reason.message : 'Could not connect to Django.'); })
       .finally(() => setLoading(false));
   };
   useEffect(() => { refresh(); }, []);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      Promise.all([apiRequest<VideoRecord[]>('/api/videos/'), listSharePointImports(), getSharePointSyncStatus()])
+        .then(([records, imports, sync]) => {
+          setVideos(records ?? []);
+          setSharepointJob(imports?.[0] ?? null);
+          setSyncStatus(sync);
+        })
+        .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Could not refresh SharePoint status.'));
+    }, 10000);
+    return () => window.clearInterval(timer);
+  }, []);
   useEffect(() => { if (!notice) return; const timer = window.setTimeout(() => setNotice(''), 3200); return () => window.clearTimeout(timer); }, [notice]);
   useEffect(() => {
     if (!sharepointJob || !['queued', 'processing', 'cancelling'].includes(sharepointJob.status)) return;
@@ -116,6 +131,12 @@ function Dashboard({ account, onLogout }: { account: Account; onLogout: () => vo
   const avgScore = videos.length ? Math.round(videos.reduce((sum, video) => sum + video.kbScore, 0) / videos.length) : 0;
   const categoryCount = (category: Category) => videos.filter((video) => video.categories.includes(category)).length;
   const readinessCount = (value: (typeof readinessFilters)[number]) => value === 'All statuses' ? videos.length : videos.filter((video) => value === 'Training ready' ? video.status === 'indexed' && video.trainingReady : value === 'Review' ? video.status === 'indexed' && !video.trainingReady : value === 'Failed' ? video.status === 'failed' : video.status === 'processing' || video.status === 'pending').length;
+  const jobGroupSize = 2;
+  const jobGroupCount = Math.max(1, Math.ceil((sharepointJob?.total ?? 0) / jobGroupSize));
+  const activeJobGroup = Math.min(jobGroupCount, Math.floor((sharepointJob?.processed ?? 0) / jobGroupSize) + 1);
+  const activeSharePointVideos = videos.filter((video) => video.sourceType === 'sharepoint');
+  const currentlyProcessing = activeSharePointVideos.filter((video) => video.status === 'processing').length;
+  const pendingVideos = activeSharePointVideos.filter((video) => video.status === 'pending').length;
 
   const clearFile = () => { setFile(null); const input = document.getElementById('video-file') as HTMLInputElement | null; if (input) input.value = ''; };
   const openVideoDetails = async (video: VideoRecord) => {
@@ -132,14 +153,16 @@ function Dashboard({ account, onLogout }: { account: Account; onLogout: () => vo
     }
   };
   const closeVideoDetails = () => { detailRequestId.current += 1; setDetailLoading(false); setSelectedVideo(null); };
-  const importSharePointFolder = async () => {
-    setError(''); setSharepointError('');
+  const syncSharePointFolderNow = async () => {
+    if (requestingSync) return;
+    setRequestingSync(true); setError(''); setSharepointError('');
     try {
-      const job = await startSharePointImport(batchSize);
-      if (!job) throw new Error('Django did not start the SharePoint import.');
-      setSharepointJob(job);
-      setNotice(`Queued the next ${job.batchSize} videos from ${job.folderName}.`);
-    } catch (reason) { setSharepointError(reason instanceof Error ? reason.message : 'Could not start the SharePoint folder import.'); }
+      const result = await syncSharePointNow();
+      if (!result) throw new Error('Django did not accept the synchronization request.');
+      setNotice(result.syncInProgress ? 'SharePoint synchronization is already running.' : 'Sync requested. The background worker will check SharePoint shortly.');
+      getSharePointSyncStatus().then(setSyncStatus).catch(() => undefined);
+    } catch (reason) { setSharepointError(reason instanceof Error ? reason.message : 'Could not request SharePoint synchronization.'); }
+    finally { setRequestingSync(false); }
   };
   const stopSharePointImport = async () => {
     if (!sharepointJob) return;
@@ -150,6 +173,20 @@ function Dashboard({ account, onLogout }: { account: Account; onLogout: () => vo
       setSharepointJob(job);
       setNotice(job.status === 'cancelling' ? 'Stop requested. The current video will finish before the worker stops.' : 'Import stopped before it started.');
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not stop the SharePoint import.'); }
+  };
+  const retrySharePointVideoAnalysis = async (video: VideoRecord) => {
+    if (sharepointRetryBusy.current) return;
+    sharepointRetryBusy.current = video.id;
+    try {
+      const job = await retrySharePointVideo(video.id);
+      if (!job) throw new Error('Django did not queue the video retry.');
+      setSharepointJob(job);
+      setNotice(`Retry queued for ${video.title}.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not retry this SharePoint video.');
+    } finally {
+      sharepointRetryBusy.current = null;
+    }
   };
   const handleAnalyze = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); setError(''); setNotice('');
@@ -198,7 +235,7 @@ function Dashboard({ account, onLogout }: { account: Account; onLogout: () => vo
 
     {manualOpen ? <UserManual onBack={() => { setManualOpen(false); window.location.hash = 'top'; }} /> : selectedVideo ? <VideoDetailPage video={selectedVideo} loading={detailLoading} onBack={closeVideoDetails} /> : <>
     <main id="top" className="dashboard-main">
-      <div className="dashboard-title"><div><div className="breadcrumb">WORKSPACE <span>/</span> LEARNING LIBRARY</div><h1>Training Material Discovery</h1><p>Turn your video library into searchable, reusable learning resources.</p></div><button className="primary-small" onClick={() => document.getElementById('video-file')?.click()}><Plus size={15} /> Add training video</button></div>
+      <div className="dashboard-title"><div><div className="breadcrumb">WORKSPACE <span>/</span> LEARNING LIBRARY</div><h1>VE-Videos-Analyser</h1><p>Turn your video library into searchable, reusable learning resources.</p></div><button className="primary-small" onClick={() => document.getElementById('video-file')?.click()}><Plus size={15} /> Add training video</button></div>
 
       <section className="metric-grid" aria-label="Library overview">
         <Metric icon={<Clapperboard size={16} />} label="VIDEOS ANALYZED" value={videos.length} detail="In your training library" tone="purple" />
@@ -210,12 +247,26 @@ function Dashboard({ account, onLogout }: { account: Account; onLogout: () => vo
       <section className={`sharepoint-hero ${sharepointJob?.status === 'failed' ? 'has-error' : ''}`} aria-labelledby="sharepoint-title">
         <div className="sharepoint-hero-copy">
           <div className="sharepoint-eyebrow"><FolderSync size={14} /> PRIMARY SOURCE · MICROSOFT SHAREPOINT</div>
-          <h2 id="sharepoint-title">Import your SharePoint training videos</h2>
-          <p>Choose how many videos to analyze per batch. Results are saved as each video finishes, so smaller batches keep the server responsive.</p>
-          <div className="sharepoint-folder-summary"><span className="sharepoint-folder-icon"><FolderSync size={17} /></span><span><small>CONNECTED FOLDER</small><b>{sharepointConfigured ? sharepointFolderName : 'Microsoft Graph setup required'}</b></span><span className={`sharepoint-status ${sharepointConfigured ? 'connected' : 'disconnected'}`}><i />{sharepointConfigured ? 'Ready to import' : 'Not configured'}</span></div>
-          {sharepointConfigured ? <div className="sharepoint-actions"><label className="sharepoint-batch-control">Videos per batch<input aria-label="Videos to analyze per batch" type="number" min={1} max={50} step={1} value={batchSize} disabled={Boolean(sharepointJob && ['queued', 'processing', 'cancelling'].includes(sharepointJob.status))} onChange={(event) => { const value = Number(event.target.value); if (Number.isInteger(value) && value >= 1 && value <= 50) setBatchSize(value); }} /></label><button type="button" className="sharepoint-import-button" onClick={() => void importSharePointFolder()} disabled={Boolean(sharepointJob && ['queued', 'processing', 'cancelling'].includes(sharepointJob.status))}><FolderSync size={16} />{sharepointJob && ['queued', 'processing', 'cancelling'].includes(sharepointJob.status) ? sharepointJob.status === 'cancelling' ? 'Stopping…' : 'Batch in progress…' : `Import next ${batchSize} videos`}<span>→</span></button>{sharepointJob && ['queued', 'processing', 'cancelling'].includes(sharepointJob.status) && <button type="button" className="sharepoint-cancel-button" onClick={() => void stopSharePointImport()} disabled={sharepointJob.status === 'cancelling'}><X size={14} />{sharepointJob.status === 'cancelling' ? 'Stopping…' : 'Stop import'}</button>}</div> : <p className="sharepoint-setup-hint">Configure Microsoft Graph access in the backend environment. Keep the app secret on the server.</p>}
-          {sharepointError && <div role="alert" className="sharepoint-job-error"><b>Could not queue the import</b><span>{sharepointError}</span></div>}
-          {sharepointJob && ['queued', 'processing', 'cancelling'].includes(sharepointJob.status) && <div className="sharepoint-progress"><span>{sharepointJob.status === 'queued' ? 'Queued · waiting for the SharePoint worker' : sharepointJob.status === 'cancelling' ? `Stop requested · finishing the current video (${sharepointJob.processed} of ${sharepointJob.total})` : `Analyzing folder: ${sharepointJob.processed} of ${sharepointJob.total || '…'} videos`}{sharepointJob.folderTotal > 0 ? ` · ${sharepointJob.folderTotal} videos in folder` : ''}</span>{sharepointJob.total > 0 && <i><b style={{ width: `${Math.min(100, Math.round(sharepointJob.processed / sharepointJob.total * 100))}%` }} /></i>}</div>}
+          <h2 id="sharepoint-title">Automatic SharePoint video synchronization</h2>
+          <p>New and changed videos are discovered and analyzed automatically in batches of two. Unchanged videos keep their saved results. SharePoint videos up to {sharepointMaxVideoSizeGb} GB are supported.</p>
+          <div className="sharepoint-folder-summary"><span className="sharepoint-folder-icon"><FolderSync size={17} /></span><span><small>CONNECTED FOLDER</small><b>{sharepointConfigured ? sharepointFolderName : 'Microsoft Graph setup required'}</b></span><span className={`sharepoint-status ${sharepointConfigured ? 'connected' : 'disconnected'}`} title="Credentials are configured on the server. The background worker checks live Microsoft Graph access."><i />{sharepointConfigured ? 'Configured' : 'Not configured'}</span></div>
+          {sharepointConfigured ? <div className="sharepoint-actions"><button type="button" className="sharepoint-import-button" onClick={() => void syncSharePointFolderNow()} disabled={requestingSync || Boolean(syncStatus?.syncInProgress)}><FolderSync size={16} />{requestingSync ? 'Requesting…' : syncStatus?.syncInProgress ? 'Syncing…' : 'Sync now'}<span>→</span></button>{sharepointJob && ['queued', 'processing', 'cancelling'].includes(sharepointJob.status) && <button type="button" className="sharepoint-cancel-button" onClick={() => void stopSharePointImport()} disabled={sharepointJob.status === 'cancelling'}><X size={14} />{sharepointJob.status === 'cancelling' ? 'Stopping…' : 'Stop import'}</button>}</div> : <p className="sharepoint-setup-hint">Configure Microsoft Graph access in the backend environment. Keep the app secret on the server.</p>}
+          {sharepointError && <div role="alert" className="sharepoint-job-error"><b>Could not request synchronization</b><span>{sharepointError}</span></div>}
+          {sharepointJob && ['queued', 'processing', 'cancelling'].includes(sharepointJob.status) && <div className="sharepoint-progress"><span>{sharepointJob.status === 'queued' ? 'Queued · waiting for the SharePoint worker' : sharepointJob.status === 'cancelling' ? `Stop requested · finishing the current video (${sharepointJob.processed} of ${sharepointJob.total})` : `Analyzed ${sharepointJob.processed} of ${sharepointJob.total || '…'} videos · group ${activeJobGroup} of ${jobGroupCount}`} {sharepointJob.folderTotal > 0 ? `· ${sharepointJob.folderTotal} videos in folder` : ''}</span>{sharepointJob.total > 0 && <i><b style={{ width: `${Math.min(100, Math.round(sharepointJob.processed / sharepointJob.total * 100))}%` }} /></i>}</div>}
+          <div className="sharepoint-stats" aria-label="SharePoint import statistics">
+            <span><b>{syncStatus?.discoveredCount ?? sharepointJob?.folderTotal ?? 0}</b> discovered</span>
+            <span><b>{activeSharePointVideos.filter((video) => video.status === 'indexed').length}</b> completed</span>
+            <span><b>{currentlyProcessing}</b> processing</span>
+            <span><b>{pendingVideos}</b> pending</span>
+            <span><b>{activeSharePointVideos.filter((video) => video.status === 'failed').length}</b> failed</span>
+          </div>
+          <div className="sharepoint-sync-panel">
+            <span><b>Automatic sync</b> · every {syncStatus?.syncIntervalHours ?? 24} hours · {syncStatus?.syncInProgress ? 'Checking SharePoint' : 'Worker status not reported'}</span>
+            <span>Last successful: {syncStatus?.lastSuccessfulSync ? new Date(syncStatus.lastSuccessfulSync).toLocaleString() : 'Not run yet'}</span>
+            <span>Next scheduled: {syncStatus?.nextScheduledSync ? new Date(syncStatus.nextScheduledSync).toLocaleString() : 'Initial sync will be queued automatically'}</span>
+            {!sharepointJob && !syncStatus?.lastError && syncStatus?.lastSuccessfulSync && !pendingVideos && !currentlyProcessing && !activeSharePointVideos.some((video) => video.status === 'failed') && <span className="sharepoint-complete"><CheckCircle2 size={14} />All videos are up to date.</span>}
+            {syncStatus?.lastError && <span role="alert" className="sync-error">Last sync failed: {syncStatus.lastError}</span>}
+          </div>
           {sharepointJob?.status === 'failed' && sharepointJob.errors[0] && <div role="alert" className="sharepoint-job-error"><b>Import could not start</b><span>{sharepointJob.errors[0].detail}</span><small>Check that the backend SharePoint worker is running and can reach Microsoft Graph.</small></div>}
           {sharepointJob?.status === 'cancelled' && <div className="sharepoint-complete"><CheckCircle2 size={15} />Import stopped after {sharepointJob.processed} of {sharepointJob.total} videos. Completed videos were saved; continue when ready.</div>}
           {sharepointJob && videos.length > 0 && ['completed', 'completed_with_errors'].includes(sharepointJob.status) && <div className="sharepoint-complete"><CheckCircle2 size={15} />{sharepointJob.total === 0 ? `No new supported videos found. ${sharepointJob.folderTotal ? `${sharepointJob.folderTotal} videos are in the folder. ` : ''}The folder is up to date.` : <>{sharepointJob.imported} of {sharepointJob.total} videos processed{sharepointJob.folderTotal ? ` · ${sharepointJob.folderTotal} videos in folder` : ''}{sharepointJob.failed ? ` · ${sharepointJob.failed} need attention` : ''}{sharepointJob.hasMore ? ` · ${sharepointJob.remaining} remaining.` : ' · Folder up to date.'}</>}</div>}
@@ -245,7 +296,7 @@ function Dashboard({ account, onLogout }: { account: Account; onLogout: () => vo
           <div className="filter-bar">{categories.map((category) => <button key={category} onClick={() => setFilter(category)} className={`filter-chip ${filter === category ? 'active' : ''}`}>{category}<span>{category === 'All materials' ? videos.length : categoryCount(category)}</span></button>)}</div>
           <div className="filter-bar readiness-filter-bar" aria-label="Filter by training readiness"><span className="readiness-filter-label">TRAINING STATUS</span>{readinessFilters.map((value) => <button key={value} onClick={() => setReadinessFilter(value)} className={`filter-chip ${readinessFilter === value ? 'active' : ''}`}>{value}<span>{readinessCount(value)}</span></button>)}</div>
           <div className="library-content">
-            {loading ? <div className="library-empty"><LoaderCircle className="spin" size={20} /> Loading Django library…</div> : visibleVideos.length ? <><div className="resource-list">{pagedVideos.map((video) => <article className="resource-row" key={video.id}><button type="button" className="resource-open" onClick={() => void openVideoDetails(video)} aria-label={`View details for ${video.title}`}><div className="resource-main"><div className="resource-thumb"><Play size={15} fill="currentColor" /></div><div className="resource-text"><div className="resource-name-line"><h3>{video.title}</h3><span className={`ready-badge ${readinessTone(video)}`}>{readinessLabel(video)}</span></div><p>{video.summary || video.errorMessage || (video.status === 'processing' ? 'Analysis is in progress.' : 'Summary is not available for this video.')}</p><div className="topic-line">{video.keyTopics.slice(0, 4).map((topic) => <span key={topic}>{topic}</span>)}</div></div></div><div className="resource-side"><div className="resource-categories">{video.categories.map((category) => <span key={category} className={`category-badge ${category.toLowerCase()}`}>{category}</span>)}</div><div className="score-row"><div className="score-track"><i style={{ width: `${Math.min(100, Math.max(0, video.kbScore))}%` }} /></div><b>{video.kbScore}%</b></div><small className="resource-meta">{video.sourceType} <span>·</span> {video.status}</small></div></button><button type="button" className="delete-resource" aria-label={`Delete ${video.title}`} onClick={() => void deleteVideo(video)}><X size={14} /></button></article>)}</div>{visibleVideos.length > pageSize && <nav className="library-pagination" aria-label="Training library pages"><span>Showing {(libraryPage - 1) * pageSize + 1}–{Math.min(libraryPage * pageSize, visibleVideos.length)} of {visibleVideos.length}</span><div><button type="button" aria-label="Previous page" onClick={() => setLibraryPage((current) => Math.max(1, current - 1))} disabled={libraryPage === 1}><ChevronLeft size={15} /> Previous</button><span>Page {libraryPage} of {pageCount}</span><button type="button" aria-label="Next page" onClick={() => setLibraryPage((current) => Math.min(pageCount, current + 1))} disabled={libraryPage === pageCount}>Next <ChevronRight size={15} /></button></div></nav>}</> : <div className="library-empty"><span className="empty-folder"><FolderOpen size={19} /></span><b>{query || filter !== 'All materials' ? 'No matching training materials' : 'Your training library is empty'}</b><span>{query || filter !== 'All materials' ? 'Try changing your search or category filter.' : 'Upload a video or paste a transcript to see its summary and topics here.'}</span></div>}
+            {loading ? <div className="library-empty"><LoaderCircle className="spin" size={20} /> Loading Django library…</div> : visibleVideos.length ? <><div className="resource-list">{pagedVideos.map((video) => <article className="resource-row" key={video.id}><button type="button" className="resource-open" onClick={() => void openVideoDetails(video)} aria-label={`View details for ${video.title}`}><div className="resource-main"><div className="resource-thumb"><Play size={15} fill="currentColor" /></div><div className="resource-text"><div className="resource-name-line"><h3>{video.title}</h3><span className={`ready-badge ${readinessTone(video)}`}>{readinessLabel(video)}</span></div><p>{video.summary || video.errorMessage || (video.status === 'processing' ? 'Analysis is in progress.' : 'Summary is not available for this video.')}</p>{video.sourceFolder && <small className="resource-folder" title={video.sourceFolder}><FolderOpen size={11} /> <span>Source folder:</span> {video.sourceFolder}</small>}<div className="topic-line">{video.keyTopics.slice(0, 4).map((topic) => <span key={topic}>{topic}</span>)}</div></div></div><div className="resource-side"><div className="resource-categories">{video.categories.map((category) => <span key={category} className={`category-badge ${category.toLowerCase()}`}>{category}</span>)}</div><div className="score-row"><div className="score-track"><i style={{ width: `${Math.min(100, Math.max(0, video.kbScore))}%` }} /></div><b>{video.kbScore}%</b></div><small className="resource-meta">{video.sourceType} <span>·</span> {video.analysisCompletedAt ? new Date(video.analysisCompletedAt).toLocaleString() : video.status}</small></div></button>{video.sourceUrl && <a className="resource-source-link" href={video.sourceUrl} target="_blank" rel="noreferrer" aria-label={`Open SharePoint video ${video.title}`} title="Open SharePoint video"><ExternalLink size={14} /></a>}{video.sourceType === 'sharepoint' && video.status === 'failed' && <button type="button" className="retry-resource" aria-label={`Retry analysis for ${video.title}`} onClick={() => void retrySharePointVideoAnalysis(video)}><FolderSync size={13} /> Retry</button>}<button type="button" className="delete-resource" aria-label={`Delete ${video.title}`} onClick={() => void deleteVideo(video)}><X size={14} /></button></article>)}</div>{visibleVideos.length > pageSize && <nav className="library-pagination" aria-label="Training library pages"><span>Showing {(libraryPage - 1) * pageSize + 1}–{Math.min(libraryPage * pageSize, visibleVideos.length)} of {visibleVideos.length}</span><div><button type="button" aria-label="Previous page" onClick={() => setLibraryPage((current) => Math.max(1, current - 1))} disabled={libraryPage === 1}><ChevronLeft size={15} /> Previous</button><span>Page {libraryPage} of {pageCount}</span><button type="button" aria-label="Next page" onClick={() => setLibraryPage((current) => Math.min(pageCount, current + 1))} disabled={libraryPage === pageCount}>Next <ChevronRight size={15} /></button></div></nav>}</> : <div className="library-empty"><span className="empty-folder"><FolderOpen size={19} /></span><b>{query || filter !== 'All materials' ? 'No matching training materials' : 'Your training library is empty'}</b><span>{query || filter !== 'All materials' ? 'Try changing your search or category filter.' : 'Upload a video or paste a transcript to see its summary and topics here.'}</span></div>}
           </div>
           <div className="library-footer"><span><CheckCircle2 size={13} /> Connected to Django · {videos.length} saved {videos.length === 1 ? 'record' : 'records'}</span><span>REAL DATA ONLY</span></div>
         </section>

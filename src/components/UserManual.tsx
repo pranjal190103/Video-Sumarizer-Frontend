@@ -19,8 +19,8 @@ const steps = [
     icon: <Sparkles size={17} />,
   },
   {
-    title: 'Import SharePoint videos in batches',
-    detail: 'Choose a batch size from 1 to 50, then select Import next videos. The backend processes the batch in the background; keep the SharePoint worker running. Use Stop import to stop after the current video. Completed videos stay saved, and you can start the next batch when ready.',
+    title: 'Let SharePoint sync automatically',
+    detail: 'After sign-in, an account with no SharePoint videos is queued for an initial scan. Use Sync now to check for newly added videos before the next daily scan. The backend worker analyzes new videos two at a time; successfully analyzed videos are never analyzed again automatically. Keep the worker running; synchronization continues while the browser is closed. You can stop an active job; completed videos remain saved.',
     icon: <FolderSync size={17} />,
   },
   {
@@ -62,7 +62,7 @@ export function UserManual({ onBack }: UserManualProps) {
       <section className="manual-notes">
         <article>
           <span className="manual-note-icon"><Tags size={15} /></span>
-          <div><h2>SharePoint and results</h2><p>The configured SharePoint folder is read by the backend using Microsoft Graph. Your administrator must grant the app access and keep its rotated secret in backend settings. Review AI output before using it in official training or a knowledge base.</p></div>
+          <div><h2>SharePoint and results</h2><p>The configured SharePoint folder is read by the backend using Microsoft Graph. Your administrator must grant the app access and keep its rotated secret in backend settings. A daily scheduled sync discovers new files and skips every successfully analyzed video. Use Retry on an individual failed card when needed. The dashboard shows sync times and analysis status. Review AI output before using it in official training or a knowledge base.</p></div>
         </article>
         <article>
           <span className="manual-note-icon help"><CircleHelp size={15} /></span>
