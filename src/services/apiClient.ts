@@ -1,6 +1,8 @@
 // Accept deployment values with or without a trailing slash. API paths below
 // always start with `/api`, so keeping a trailing slash creates `//api/...`.
-export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+// Development uses Vite's /api proxy so browser requests stay same-origin.
+// Production builds use the separately hosted Django API URL.
+export const API_BASE_URL = (import.meta.env.DEV ? '' : import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
 export const isApiConfigured = Boolean(API_BASE_URL) || import.meta.env.DEV;
 const TOKEN_KEY = 'video-intelligence-token';
 

@@ -4,7 +4,7 @@ Video Intelligence is a React + TypeScript dashboard connected to a Django REST 
 
 ## Local setup
 
-In local development Vite proxies `/api` requests to Django at `http://127.0.0.1:8000`, so no frontend API secret or `.env.local` file is needed.
+In local development Vite proxies `/api` requests to Django at `http://127.0.0.1:8000`, so no frontend API secret or `.env.local` file is needed. If Django uses a different host or port, set `VITE_DEV_API_PROXY_TARGET` in the Vite environment (for example `http://127.0.0.1:8011`). Development requests always use this same-origin proxy; production builds use `VITE_API_BASE_URL`.
 
 Frontend terminal:
 
